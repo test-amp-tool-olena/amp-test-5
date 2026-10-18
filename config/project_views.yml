@@ -1,0 +1,108 @@
+# -----------------------------------------------------------------------------
+# Copyright (c) 2026 Xebia. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# This software, associated workflows, and configuration assets are the
+# proprietary property of Xebia. Possession or use of this software is
+# authorized strictly during an active professional services engagement with
+# Xebia and subject to the terms of the governing engagement agreement.
+#
+# Unauthorized copying, reverse engineering, redistribution, or continued use
+# after engagement termination is strictly prohibited.
+#
+# DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY:
+# THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL
+# XEBIA OR ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) ARISING IN ANY WAY OUT OF THE USE OF OR INABILITY TO USE THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# USAGE IS ENTIRELY AT YOUR OWN RISK.
+# -----------------------------------------------------------------------------
+
+# Project v2 view template for `amp install`.
+#
+# Refresh this file from the canonical reference project with:
+#   amp export-project-views --owner migration-sandbox --number 1 \
+#       --output config/project_views.yml
+#
+# Limitation: group_by is not settable via API (no createProjectV2View
+# GraphQL mutation as of May 2026, and the REST endpoint does not accept
+# group_by). After install, set group_by per-view in the UI:
+#   <view> -> ... -> Group by -> <field>
+#
+# Note: the reference project has two views literally named "By Status"
+# (one table, one board). `apply_views_template` dedupes by name, so the
+# board variant is renamed to "By Status (Board)" here. Rename in the
+# UI after install if exact parity with the reference is required.
+views:
+- name: By Status
+  layout: table
+  filter: ''
+  visible_fields:
+  - Title
+  - Status
+  - Age
+- name: By Age
+  layout: table
+  filter: ''
+  visible_fields:
+  - Title
+  - Status
+  - Labels
+- name: By Status (Board)
+  layout: board
+  filter: ''
+  visible_fields:
+  - Title
+  - Assignees
+  - Status
+  - Linked pull requests
+  - Sub-issues progress
+  - Age
+  - LFS
+  - Submodules
+- name: By Size
+  layout: board
+  filter: -status:Migrate,Analyzing,"Dry Run"
+  visible_fields:
+  - Title
+  - Assignees
+  - Status
+  - Linked pull requests
+  - Sub-issues progress
+- name: LFS
+  layout: table
+  filter: ''
+  visible_fields:
+  - Title
+  - Status
+- name: Blockers
+  layout: board
+  filter: ''
+  visible_fields:
+  - Title
+  - Assignees
+  - Linked pull requests
+  - Sub-issues progress
+  - Size
+- name: By SCM
+  layout: board
+  filter: ''
+  visible_fields:
+  - Title
+  - Assignees
+  - Status
+  - Linked pull requests
+  - Sub-issues progress
+- name: StatusByTeam
+  layout: board
+  filter: -status:Analyzing,Analyzed,"Dry Run","Dry Run Failed",Migrate
+  visible_fields:
+  - Title
+  - Assignees
+  - Status
+  - Linked pull requests
+  - Sub-issues progress

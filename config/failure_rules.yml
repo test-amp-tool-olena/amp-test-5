@@ -1,0 +1,270 @@
+# -----------------------------------------------------------------------------
+# Copyright (c) 2026 Xebia. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# This software, associated workflows, and configuration assets are the
+# proprietary property of Xebia. Possession or use of this software is
+# authorized strictly during an active professional services engagement with
+# Xebia and subject to the terms of the governing engagement agreement.
+#
+# Unauthorized copying, reverse engineering, redistribution, or continued use
+# after engagement termination is strictly prohibited.
+#
+# DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY:
+# THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL
+# XEBIA OR ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) ARISING IN ANY WAY OUT OF THE USE OF OR INABILITY TO USE THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# USAGE IS ENTIRELY AT YOUR OWN RISK.
+# -----------------------------------------------------------------------------
+
+# Deterministic failure rules (Tier 1)
+# Each rule: pattern match on logs/result → root cause + fix
+# Rules are evaluated in order; first match wins
+# Confidence >90 skips AI analysis entirely
+
+rules:
+  - slug: repo-already-exists
+    patterns:
+      - "already exists"
+      - "already contain"
+      - "name already exists on this account"
+    confidence: 95
+    fix: |
+      The target repository already exists. AMP does not auto-delete it —
+      resolve manually. Either:
+      1. Run `/remigrate` to replace the target repo (this deletes and
+         re-migrates it intentionally).
+      2. Choose a different target repo name.
+    labels: []
+
+  - slug: lfs-objects-missing-after-push
+    # The post-migration LFS verifier in `amp.migration_verify._check_lfs`
+    # writes "object(s) still missing after push" when `git lfs push --all`
+    # exited 0 but the destination LFS Batch API still reports objects
+    # absent. git-lfs is known to exit 0 on per-object transfer failures,
+    # so this asymmetry between push exit code and Batch API state is the
+    # canonical signal. Must precede `expired-pat` below — the gh gei
+    # migration log URL contains "X-Amz-Credential" (S3 presigned URL
+    # signing field) which would otherwise overmatch that rule's patterns.
+    patterns:
+      - "object(s) still missing after push"
+      - "destination LFS server still reports"
+    confidence: 95
+    fix: |
+      Source LFS objects exist but did not land on the destination LFS server.
+      git-lfs reported success but the destination Batch API confirms a gap.
+      1. Check destination org LFS storage quota.
+      2. Verify destination PAT/App has `Contents: write` on the target repo
+         (LFS write delegates to git push auth).
+      3. If the destination org is SAML-gated, re-authorize the PAT for that
+         org and re-run.
+      4. Run `git lfs fsck` against the source clone to confirm the missing
+         OIDs are actually retrievable from the source LFS server (orphaned
+         pointers are reported in the verifier's `Sample missing OIDs` list).
+    labels: ["lfs:dest-missing"]
+
+  - slug: expired-pat
+    # Use high-signal phrases only. Bare substrings like "credential" or
+    # "401" overmatch incidental log content — most commonly the gh gei
+    # migration-log URL's `X-Amz-Credential=` S3 signing field, and JSON
+    # error payloads that quote status codes — and would steal the diagnosis
+    # from more specific rules below.
+    patterns:
+      - "Bad credentials"
+      - "could not read Username"
+      - "token has expired"
+      - "authentication failed"
+      - "HTTP 401"
+      - "remote: Invalid username or password"
+    confidence: 92
+    fix: |
+      Authentication failed. Check that:
+      1. The PAT/token has not expired
+      2. The PAT has the required scopes (repo, admin:org, workflow)
+      3. The correct token is set in repo secrets
+    labels: []
+
+  - slug: insufficient-permissions
+    patterns:
+      - "403"
+      - "forbidden"
+      - "not have permission"
+      - "access denied"
+      - "Resource not accessible"
+    confidence: 90
+    fix: |
+      Insufficient permissions. Verify:
+      1. PAT has required scopes for the operation
+      2. User/app has admin access to both source and target orgs
+      3. IP allow lists are not blocking access
+    labels: []
+
+  - slug: source-repo-not-found
+    patterns:
+      - "not found"
+      - "does not exist"
+      - "could not find"
+      - "repository not found"
+    confidence: 88
+    fix: |
+      Source repository not found. Check:
+      1. The org/project/repo name is spelled correctly
+      2. The PAT has read access to the source repo
+      3. The repo hasn't been deleted or renamed
+    labels: []
+
+  - slug: rate-limited
+    patterns:
+      - "rate limit"
+      - "abuse detection"
+      - "secondary rate limit"
+      - "API rate limit exceeded"
+    confidence: 95
+    fix: |
+      Rate limited by the API. Wait and retry:
+      1. Check rate limit status: `gh api rate_limit`
+      2. Wait for the reset window
+      3. Consider using a GitHub App token for higher limits
+    labels: []
+
+  - slug: network-timeout
+    patterns:
+      - "timeout"
+      - "connection refused"
+      - "ETIMEDOUT"
+      - "network error"
+      - "DNS resolution"
+      - "connection reset"
+    confidence: 88
+    fix: |
+      Network connectivity issue. Check:
+      1. Source/target endpoints are reachable
+      2. VPN/firewall settings allow access
+      3. DNS resolution is working
+      4. Retry — may be transient
+    labels: []
+
+  - slug: invalid-ref-name
+    patterns:
+      - "invalid ref"
+      - "bad ref name"
+      - "not a valid ref"
+      - "Ref names must"
+      - "Validate Ref Names"
+    confidence: 92
+    fix: |
+      Repository has ref names that violate GitHub naming rules.
+      1. Run `/update-issue` to identify problematic refs
+      2. Rename or delete invalid branches/tags in the source repo
+      3. Common issues: spaces, special characters, exceeding 255 chars
+    labels: ["ref:long"]
+
+  - slug: archive-generation-timeout
+    patterns:
+      - "archive generation"
+      - "export timed out"
+      - "archive timed out"
+      - "migration archive"
+    confidence: 90
+    fix: |
+      The migration archive generation timed out. This usually means the repo is too large.
+      1. Check repo size — consider splitting or cleaning history
+      2. Remove large binary files from history with git-filter-repo
+      3. Retry with `--queue-only` to allow more time
+    labels: []
+
+  - slug: metadata-archive-oversized
+    # Destination migrator rejected the source's metadata archive at the
+    # 40 GB hard cap. The empirically dominant cause is bulky release
+    # binaries — they ship inside the metadata archive alongside issues,
+    # PRs, comments, and attachments. Match on the destination's exact
+    # validator string so this beats the broader rules below.
+    patterns:
+      - "Size must be less than 40 GB and greater than zero bytes"
+      - "ExtractRepoArchive: Failed to validate archive"
+    confidence: 95
+    fix: |
+      Destination migrator rejected the source's metadata archive because it
+      exceeds the 40 GB cap (or is 0 bytes). Release attachments are the
+      usual bloat source — they're bundled into the metadata archive.
+      1. Add the `cfg:skip-releases` label to the issue and re-trigger
+         `/dryrun` — this passes `--skip-releases` to `gh gei migrate-repo`
+         so release attachments are not exported.
+      2. If still oversized after skipping releases, inventory issue/PR
+         attachments and consider scrubbing the largest ones from the
+         source repo before re-migrating.
+    labels: ["meta:oversized"]
+
+  - slug: metadata-generation-failed
+    # Generic fallback for destination-side metadata failures that don't
+    # match a more specific signature above. Lower confidence so Tier-2 can
+    # still take over when an obvious cause isn't apparent from the log.
+    patterns:
+      - "Repository metadata failed to be generated"
+      - "metadata failed to be generated"
+      - "Metadata archive could not be extracted"
+    confidence: 80
+    fix: |
+      The destination migrator could not generate or extract the source-repo
+      metadata archive. Check the full migrator log for the specific reason:
+        gh gei download-logs --target-api-url $GH_DEST_API_URL \
+          --github-target-org <dst-org> --target-repo <dst-repo>
+      Common causes:
+      1. Metadata archive exceeded the 40 GB cap (look for "Failed to
+         validate archive" in the log; add `cfg:skip-releases` and retry)
+      2. Source-side LFS server unreachable from the destination migrator
+      3. Source ref names violated GitHub naming rules
+    labels: []
+
+  - slug: lfs-objects-missing
+    # Do NOT include bare "lfs" — it overmatches the gh gei migration log
+    # URL (`objects-origin.<host>/octoshiftmigrationlogs/...`), the
+    # `lfs.storage` git config string, and every `git lfs ...` command
+    # echoed via subprocess logging. Keep phrase-level patterns only.
+    patterns:
+      - "smudge filter"
+      - "pointer file"
+      - "LFS object not found"
+      - "batch response"
+      - "git lfs fetch failed"
+      - "git lfs push failed"
+    confidence: 85
+    fix: |
+      LFS objects are missing or inaccessible.
+      1. Verify LFS server is reachable from the migration runner
+      2. Run `git lfs fsck` on the source repo to check integrity
+      3. Ensure the PAT has LFS read access
+      4. If objects are permanently lost, consider migrating without LFS
+    labels: ["lfs:broken"]
+
+  - slug: large-file-blocked
+    patterns:
+      - "exceeds GitHub's file size limit"
+      - "this exceeds GitHub"
+      - "file is 100.00 MB"
+      - "pre-receive hook declined"
+    confidence: 93
+    fix: |
+      A file exceeds GitHub's 100MB file size limit.
+      1. Identify the large file(s) from the error message
+      2. Use git-filter-repo or BFG to remove from history
+      3. Or set up LFS tracking for the file type before migration
+      4. Then use `/remigrate`
+    labels: ["blob:error"]
+
+  - slug: empty-repo
+    patterns:
+      - "empty repository"
+      - "does not have any commits"
+      - "no commits"
+    confidence: 95
+    fix: |
+      The source repository is empty (no commits). Empty repos cannot be migrated.
+      1. Either skip this repo or initialize it with at least one commit
+      2. Close this issue if the repo should not be migrated
+    labels: ["stale"]

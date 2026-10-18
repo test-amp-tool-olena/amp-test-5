@@ -1,0 +1,38 @@
+name: GitLab Migration
+description: Migrate a repo from GitLab to GitHub
+labels: ["provider:gitlab"]
+body:
+  - type: input
+    id: source_org
+    attributes:
+      label: Source Group
+      description: GitLab group/namespace
+    validations:
+      required: true
+  - type: input
+    id: source_repo
+    attributes:
+      label: Source Repo
+      description: Project name in GitLab
+    validations:
+      required: true
+  - type: input
+    id: target_org
+    attributes:
+      label: Target Org
+      description: Destination GitHub organization
+    validations:
+      required: true
+  - type: input
+    id: target_repo
+    attributes:
+      label: Target Repo
+      description: Destination repository name (defaults to source name)
+  - type: markdown
+    attributes:
+      value: |
+        ## Available Commands
+        - `/dryrun` — Dry run migration to sandbox
+        - `/migrate` — Production migration
+        - `/remigrate` — Delete target and re-migrate
+        - `/update-issue` — Re-run analysis

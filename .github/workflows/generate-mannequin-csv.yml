@@ -1,0 +1,106 @@
+# -----------------------------------------------------------------------------
+# Copyright (c) 2026 Xebia. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# This software, associated workflows, and configuration assets are the
+# proprietary property of Xebia. Possession or use of this software is
+# authorized strictly during an active professional services engagement with
+# Xebia and subject to the terms of the governing engagement agreement.
+#
+# Unauthorized copying, reverse engineering, redistribution, or continued use
+# after engagement termination is strictly prohibited.
+#
+# DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY:
+# THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL
+# XEBIA OR ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) ARISING IN ANY WAY OUT OF THE USE OF OR INABILITY TO USE THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# USAGE IS ENTIRELY AT YOUR OWN RISK.
+# -----------------------------------------------------------------------------
+
+name: Generate Mannequin CSV
+run-name: "Generate mannequin CSV for ${{ inputs.target_org }}"
+
+# Step 1 of mannequin reclamation. Walks the destination org for every
+# unclaimed mannequin (placeholder users that gh gei creates when source
+# commit authors / PR actors don't map to a real destination identity)
+# and writes them to a CSV. The operator downloads the artifact, fills
+# in the `target` (real GitHub login) column, commits it to
+# mannequins/<org>.csv on this repo, then triggers Reclaim Mannequins.
+#
+# Org-scoped on purpose — mannequin records live at the org level, not
+# the repo level. See amp/mannequins.py for the shared backend.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_org:
+        description: "Destination org whose mannequins to enumerate"
+        required: true
+        type: string
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  generate:
+    runs-on: ${{ fromJSON(vars.AMP_RUNNER_RECLAIM_MANNEQUINS || vars.AMP_RUNNER || '"ubuntu-latest"') }}
+
+    steps:
+      # Mint App tokens for control-repo checkout. AMP App is preferred;
+      # primary App is back-compat fallback for installs where control repo
+      # lives on the host tenant.
+      - name: Mint AMP App token (best-effort)
+        id: amp-app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.AMP_APP_ID }}
+          private-key: ${{ secrets.AMP_APP_PRIVATE_KEY }}
+
+      - name: Mint primary App token (best-effort)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ steps.amp-app-token.outputs.token || steps.app-token.outputs.token || secrets.GH_AMP_PAT || secrets.GH_DEST_PAT }}
+
+      - name: Setup AMP
+        uses: ./.github/actions/setup-amp
+        with:
+          dist-token: ${{ secrets.AMP_DIST_TOKEN }}
+          version:    ${{ vars.AMP_VERSION }}
+          dist-repo:  ${{ vars.AMP_DIST_REPO }}
+          extensions: gei
+          github-com-token: ${{ secrets.GH_COM_TOKEN }}
+
+      - name: Generate mannequin CSV
+        run: |
+          mkdir -p mannequins
+          amp generate-mannequin-csv \
+            --org "${{ inputs.target_org }}" \
+            --output "mannequins/${{ inputs.target_org }}.csv"
+        env:
+          GH_DEST_PAT: ${{ secrets.GH_DEST_PAT }}
+          GH_DEST_API_URL: ${{ vars.GH_DEST_API_URL }}
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          DEST_APP_ID: ${{ secrets.DEST_APP_ID }}
+          DEST_APP_PRIVATE_KEY: ${{ secrets.DEST_APP_PRIVATE_KEY }}
+
+      - name: Upload CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mannequins-${{ inputs.target_org }}-${{ github.run_id }}
+          path: mannequins/${{ inputs.target_org }}.csv
+          retention-days: 30

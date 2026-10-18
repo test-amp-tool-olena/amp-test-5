@@ -1,0 +1,103 @@
+# -----------------------------------------------------------------------------
+# Copyright (c) 2026 Xebia. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# This software, associated workflows, and configuration assets are the
+# proprietary property of Xebia. Possession or use of this software is
+# authorized strictly during an active professional services engagement with
+# Xebia and subject to the terms of the governing engagement agreement.
+#
+# Unauthorized copying, reverse engineering, redistribution, or continued use
+# after engagement termination is strictly prohibited.
+#
+# DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY:
+# THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL
+# XEBIA OR ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) ARISING IN ANY WAY OUT OF THE USE OF OR INABILITY TO USE THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# USAGE IS ENTIRELY AT YOUR OWN RISK.
+# -----------------------------------------------------------------------------
+
+name: Reclaim Mannequins
+run-name: "Reclaim mannequins in ${{ inputs.target_org }} from ${{ inputs.csv_path }}"
+
+# Step 2 of mannequin reclamation. Reads a filled-in CSV from this
+# repo and runs `gh gei reclaim-mannequin` once for the destination
+# org. GEI walks every mannequin and rewrites attributions across all
+# imported repos in a single pass — this is the org-wide step.
+#
+# Generate the CSV via the Generate Mannequin CSV workflow first,
+# download the artifact, fill in the `target` column (real GitHub
+# logins), and commit the file to mannequins/<org>.csv on this repo
+# before triggering this workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_org:
+        description: "Destination org to reclaim mannequins in"
+        required: true
+        type: string
+      csv_path:
+        description: "Path to the filled-in CSV (relative to repo root)"
+        required: true
+        type: string
+        default: "mannequins/<org>.csv"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  reclaim:
+    runs-on: ${{ fromJSON(vars.AMP_RUNNER_RECLAIM_MANNEQUINS || vars.AMP_RUNNER || '"ubuntu-latest"') }}
+
+    steps:
+      # Mint App tokens for control-repo checkout (this is where the
+      # filled-in CSV lives). AMP App is preferred; primary App is
+      # back-compat fallback.
+      - name: Mint AMP App token (best-effort)
+        id: amp-app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.AMP_APP_ID }}
+          private-key: ${{ secrets.AMP_APP_PRIVATE_KEY }}
+
+      - name: Mint primary App token (best-effort)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ steps.amp-app-token.outputs.token || steps.app-token.outputs.token || secrets.GH_AMP_PAT || secrets.GH_DEST_PAT }}
+
+      - name: Setup AMP
+        uses: ./.github/actions/setup-amp
+        with:
+          dist-token: ${{ secrets.AMP_DIST_TOKEN }}
+          version:    ${{ vars.AMP_VERSION }}
+          dist-repo:  ${{ vars.AMP_DIST_REPO }}
+          extensions: gei
+          github-com-token: ${{ secrets.GH_COM_TOKEN }}
+
+      - name: Reclaim mannequins
+        run: |
+          amp reclaim-mannequins \
+            --org "${{ inputs.target_org }}" \
+            --csv "${{ inputs.csv_path }}"
+        env:
+          GH_DEST_PAT: ${{ secrets.GH_DEST_PAT }}
+          GH_DEST_API_URL: ${{ vars.GH_DEST_API_URL }}
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          DEST_APP_ID: ${{ secrets.DEST_APP_ID }}
+          DEST_APP_PRIVATE_KEY: ${{ secrets.DEST_APP_PRIVATE_KEY }}

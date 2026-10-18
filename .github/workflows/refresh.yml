@@ -1,0 +1,164 @@
+# -----------------------------------------------------------------------------
+# Copyright (c) 2026 Xebia. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# This software, associated workflows, and configuration assets are the
+# proprietary property of Xebia. Possession or use of this software is
+# authorized strictly during an active professional services engagement with
+# Xebia and subject to the terms of the governing engagement agreement.
+#
+# Unauthorized copying, reverse engineering, redistribution, or continued use
+# after engagement termination is strictly prohibited.
+#
+# DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY:
+# THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL
+# XEBIA OR ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) ARISING IN ANY WAY OUT OF THE USE OF OR INABILITY TO USE THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# USAGE IS ENTIRELY AT YOUR OWN RISK.
+# -----------------------------------------------------------------------------
+
+name: Refresh Source
+run-name: "Refresh ${{ inputs.mode || 'all' }}: ${{ inputs.source }} ${{ inputs.org }}${{ inputs.project && format('/{0}', inputs.project) || '' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Source type"
+        required: true
+        type: choice
+        default: github
+        options:
+          - github
+          - ado
+          - bitbucket
+          - bitbucket-cloud
+          - gitlab
+      org:
+        description: "Source org/group (leave blank to use vars.DEFAULT_SOURCE_ORG)"
+        required: false
+      project:
+        description: "Team project (ADO only)"
+        required: false
+      mode:
+        description: "discover=new only, refresh=update existing + obsolete, all=both"
+        required: false
+        type: choice
+        default: all
+        options:
+          - all
+          - discover
+          - refresh
+      allow_large_shrink:
+        description: "Override the >50% repo-count drop guard"
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: "Print intended changes without writing"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: refresh-${{ inputs.source }}-${{ inputs.org }}-${{ inputs.project }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  refresh:
+    runs-on: ${{ fromJSON(vars.AMP_RUNNER_REFRESH || vars.AMP_RUNNER || '"ubuntu-latest"') }}
+
+    steps:
+      # Mint App tokens for control-repo access. AMP App is the dedicated
+      # control-repo credential; primary App is back-compat fallback.
+      - name: Mint AMP App token (best-effort)
+        id: amp-app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.AMP_APP_ID }}
+          private-key: ${{ secrets.AMP_APP_PRIVATE_KEY }}
+
+      - name: Mint primary App token (best-effort)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ steps.amp-app-token.outputs.token || steps.app-token.outputs.token || secrets.GH_AMP_PAT || secrets.GH_DEST_PAT }}
+
+      - name: Setup AMP
+        uses: ./.github/actions/setup-amp
+        with:
+          dist-token: ${{ secrets.AMP_DIST_TOKEN }}
+          version:    ${{ vars.AMP_VERSION }}
+          dist-repo:  ${{ vars.AMP_DIST_REPO }}
+
+      - name: Resolve source org
+        id: resolve
+        run: |
+          ORG="${{ inputs.org }}"
+          if [ -z "$ORG" ]; then
+            ORG="${{ vars.DEFAULT_SOURCE_ORG }}"
+          fi
+          if [ -z "$ORG" ]; then
+            echo "::error::No source org provided and vars.DEFAULT_SOURCE_ORG is not set"
+            exit 1
+          fi
+          echo "org=$ORG" >> "$GITHUB_OUTPUT"
+
+      - name: Run refresh
+        run: |
+          amp --verbose refresh \
+            --source ${{ inputs.source || 'github' }} \
+            --org "${{ steps.resolve.outputs.org }}" \
+            ${{ inputs.project && format('--project "{0}"', inputs.project) || '' }} \
+            --repo ${{ github.repository }} \
+            --mode ${{ inputs.mode || 'all' }} \
+            ${{ inputs.allow_large_shrink && '--allow-large-shrink' || '' }} \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_DEST_PAT: ${{ secrets.GH_DEST_PAT }}
+          GH_AMP_PAT: ${{ secrets.GH_AMP_PAT }}
+          GH_API_URL: ${{ vars.GH_API_URL }}
+          GH_DEST_API_URL: ${{ vars.GH_DEST_API_URL }}
+          GH_AMP_API_URL: ${{ vars.GH_AMP_API_URL }}
+          ADO_PAT: ${{ secrets.ADO_PAT }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_URL: ${{ vars.GITLAB_URL }}
+          BBS_PAT: ${{ secrets.BBS_PAT }}
+          BBS_URL: ${{ vars.BBS_URL }}
+          BITBUCKET_API_TOKEN: ${{ secrets.BITBUCKET_API_TOKEN }}
+          BITBUCKET_EMAIL: ${{ vars.BITBUCKET_EMAIL }}
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          DEST_APP_ID: ${{ secrets.DEST_APP_ID }}
+          DEST_APP_PRIVATE_KEY: ${{ secrets.DEST_APP_PRIVATE_KEY }}
+          AMP_APP_ID: ${{ secrets.AMP_APP_ID }}
+          AMP_APP_PRIVATE_KEY: ${{ secrets.AMP_APP_PRIVATE_KEY }}
+          # Must match analyze.yml / issue-ops.yml so bulk refresh honors the
+          # same default-prefix opt-out. Without this, `amp refresh` would
+          # re-add `dst-prefix:<default>` to every issue on every run when
+          # the operator has set the flag.
+          AMP_DISABLE_DEFAULT_REPO_PREFIX: ${{ vars.AMP_DISABLE_DEFAULT_REPO_PREFIX }}
+          # Must match analyze.yml / issue-ops.yml so bulk refresh honors the
+          # same source-teams opt-out. Without this, `amp refresh` would
+          # re-discover src-team:* labels on every run when the operator
+          # has set the flag.
+          AMP_DISABLE_SOURCE_TEAMS: ${{ vars.AMP_DISABLE_SOURCE_TEAMS }}
+          AMP_PROJECT_OWNER: ${{ vars.AMP_PROJECT_OWNER }}
+          AMP_PROJECT_NUMBER: ${{ vars.AMP_PROJECT_NUMBER }}

@@ -1,0 +1,218 @@
+# -----------------------------------------------------------------------------
+# Copyright (c) 2026 Xebia. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# This software, associated workflows, and configuration assets are the
+# proprietary property of Xebia. Possession or use of this software is
+# authorized strictly during an active professional services engagement with
+# Xebia and subject to the terms of the governing engagement agreement.
+#
+# Unauthorized copying, reverse engineering, redistribution, or continued use
+# after engagement termination is strictly prohibited.
+#
+# DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY:
+# THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL
+# XEBIA OR ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) ARISING IN ANY WAY OUT OF THE USE OF OR INABILITY TO USE THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# USAGE IS ENTIRELY AT YOUR OWN RISK.
+# -----------------------------------------------------------------------------
+
+name: Label Operations
+run-name: "Label: ${{ github.event.label.name }} → #${{ github.event.issue.number }} ${{ github.event.issue.title }}"
+
+on:
+  issues:
+    types: [labeled]
+
+# Least-privilege default: checkout needs contents:read; all issue-write
+# operations authenticate via App tokens or PATs, not GITHUB_TOKEN.
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  dispatch-command:
+    # Only allocate a runner for cmd:* labels — all other label events are
+    # no-ops and were previously costing ~$0.008/min × 100 labels × N issues.
+    if: startsWith(github.event.label.name, 'cmd:')
+    runs-on: ${{ fromJSON(vars.AMP_RUNNER_LABEL_OPS || vars.AMP_RUNNER || '"ubuntu-latest"') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Mint a GitHub App installation token for the AMP-specific App
+      # (AMP_APP_ID + AMP_APP_PRIVATE_KEY) — this is the App installed on the
+      # control repo's tenant. Fails silently when secrets are unset or the
+      # App isn't installed; next step falls through to the primary App, then
+      # to PATs.
+      - name: Mint AMP App token (best-effort)
+        id: amp-app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.AMP_APP_ID }}
+          private-key: ${{ secrets.AMP_APP_PRIVATE_KEY }}
+
+      # Back-compat: primary App (installed on host tenant). Used when AMP
+      # App isn't configured but the control repo happens to live on the
+      # host tenant.
+      - name: Mint primary App token (best-effort)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Set token
+        id: token
+        run: |
+          echo "value=${{ steps.amp-app-token.outputs.token || steps.app-token.outputs.token || secrets.GH_AMP_PAT || secrets.GH_DEST_PAT }}" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch cmd:dryrun
+        if: github.event.label.name == 'cmd:dryrun'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: /dryrun
+          token: ${{ steps.token.outputs.value }}
+
+      - name: Dispatch cmd:migrate
+        if: github.event.label.name == 'cmd:migrate'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: /migrate
+          token: ${{ steps.token.outputs.value }}
+
+      - name: Dispatch cmd:migrate-with-submodules
+        if: github.event.label.name == 'cmd:migrate-with-submodules'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: /migrate-with-submodules
+          token: ${{ steps.token.outputs.value }}
+
+      - name: Dispatch cmd:migrate-submodules-deep
+        if: github.event.label.name == 'cmd:migrate-submodules-deep'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: /migrate-submodules-deep
+          token: ${{ steps.token.outputs.value }}
+
+      - name: Dispatch cmd:remigrate
+        if: github.event.label.name == 'cmd:remigrate'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: /remigrate
+          token: ${{ steps.token.outputs.value }}
+
+      - name: Dispatch cmd:archive
+        if: github.event.label.name == 'cmd:archive'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: /archive
+          token: ${{ steps.token.outputs.value }}
+
+      - name: Dispatch cmd:unarchive
+        if: github.event.label.name == 'cmd:unarchive'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: /unarchive
+          token: ${{ steps.token.outputs.value }}
+
+      - name: Dispatch cmd:set-properties
+        if: github.event.label.name == 'cmd:set-properties'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: /set-properties
+          token: ${{ steps.token.outputs.value }}
+
+      - name: Dispatch cmd:update-issue
+        if: github.event.label.name == 'cmd:update-issue'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: /update-issue
+          token: ${{ steps.token.outputs.value }}
+
+      - name: Dispatch cmd:upsert-teams
+        if: github.event.label.name == 'cmd:upsert-teams'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: /upsert-teams
+          token: ${{ steps.token.outputs.value }}
+
+      - name: Dispatch cmd:upsert-secrets
+        if: github.event.label.name == 'cmd:upsert-secrets'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: /upsert-secrets
+          token: ${{ steps.token.outputs.value }}
+
+      - name: Dispatch cmd:upsert-envs
+        if: github.event.label.name == 'cmd:upsert-envs'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: /upsert-envs
+          token: ${{ steps.token.outputs.value }}
+
+      - name: Dispatch cmd:upsert-protection
+        if: github.event.label.name == 'cmd:upsert-protection'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: /upsert-protection
+          token: ${{ steps.token.outputs.value }}
+
+      - name: Dispatch cmd:upsert-properties
+        if: github.event.label.name == 'cmd:upsert-properties'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: /upsert-properties
+          token: ${{ steps.token.outputs.value }}
+
+      - name: Dispatch cmd:upsert-fixes
+        if: github.event.label.name == 'cmd:upsert-fixes'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: /upsert-fixes
+          token: ${{ steps.token.outputs.value }}
+
+      - name: Dispatch cmd:upsert-validate
+        if: github.event.label.name == 'cmd:upsert-validate'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: /upsert-validate
+          token: ${{ steps.token.outputs.value }}
+
+      - name: Remove command label
+        if: startsWith(github.event.label.name, 'cmd:')
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.token.outputs.value }}
+          script: |
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              name: '${{ github.event.label.name }}'
+            });

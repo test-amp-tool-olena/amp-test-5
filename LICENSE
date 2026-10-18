@@ -1,0 +1,18 @@
+# Proprietary Software Notice & License
+
+Copyright (c) 2026 Xebia. All rights reserved.
+
+## 1. Proprietary & Confidential
+This repository, its workflows, scripts, configuration templates, and associated binaries (collectively, the "Software") are the proprietary and confidential intellectual property of Xebia.
+
+## 2. Limited Engagement License
+Possession, installation, or use of this Software is authorized strictly under the following conditions:
+- **Scope:** Solely for internal repository and workflow migration operations conducted in connection with an active professional services engagement with Xebia.
+- **Term:** Authorization automatically terminates upon the completion, expiration, or termination of the governing engagement agreement.
+- **Restrictions:** You may not copy, sublicense, distribute, publish, transfer, decompile, disassemble, reverse engineer, or create derivative works of any portion of this Software without prior express written permission from Xebia.
+
+## 3. Disclaimer of Warranty & "As Is" Provision
+THIS SOFTWARE IS PROVIDED BY XEBIA "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT ARE DISCLAIMED. XEBIA MAKES NO REPRESENTATION OR WARRANTY THAT THE OPERATION OF THE SOFTWARE WILL BE UNINTERRUPTED, SECURE, OR ERROR-FREE. USAGE IS ENTIRELY AT YOUR OWN RISK.
+
+## 4. Limitation of Liability
+IN NO EVENT SHALL XEBIA, ITS AFFILIATES, OFFICERS, DIRECTORS, EMPLOYEES, OR AGENTS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, PUNITIVE, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, REPOSITORIES, GIT HISTORY, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF, RELIANCE ON, OR INABILITY TO USE THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

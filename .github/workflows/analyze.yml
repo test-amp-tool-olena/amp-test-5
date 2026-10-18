@@ -1,0 +1,217 @@
+# -----------------------------------------------------------------------------
+# Copyright (c) 2026 Xebia. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# This software, associated workflows, and configuration assets are the
+# proprietary property of Xebia. Possession or use of this software is
+# authorized strictly during an active professional services engagement with
+# Xebia and subject to the terms of the governing engagement agreement.
+#
+# Unauthorized copying, reverse engineering, redistribution, or continued use
+# after engagement termination is strictly prohibited.
+#
+# DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY:
+# THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL
+# XEBIA OR ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) ARISING IN ANY WAY OUT OF THE USE OF OR INABILITY TO USE THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# USAGE IS ENTIRELY AT YOUR OWN RISK.
+# -----------------------------------------------------------------------------
+
+name: Analyze Source
+run-name: "Analyze: ${{ inputs.source }} ${{ inputs.org }}/${{ inputs.project }} → ${{ inputs.target_org }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Source type"
+        required: true
+        type: choice
+        default: github
+        options:
+          - github
+          - ado
+          - bitbucket
+          - bitbucket-cloud
+          - gitlab
+      org:
+        description: "Source org/group (leave blank to use vars.DEFAULT_SOURCE_ORG)"
+        required: false
+      project:
+        description: "Team project — REQUIRED for ADO source, ignored otherwise"
+        required: false
+      target_org:
+        description: "Target GitHub org"
+        required: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  analyze:
+    runs-on: ${{ fromJSON(vars.AMP_RUNNER_ANALYZE || vars.AMP_RUNNER || '"ubuntu-latest"') }}
+
+    steps:
+      # Mint App tokens for control-repo checkout. AMP App is preferred (it's
+      # installed on the control-repo tenant); primary App is the back-compat
+      # fallback for installs where control repo lives on the host tenant.
+      - name: Mint AMP App token (best-effort)
+        id: amp-app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.AMP_APP_ID }}
+          private-key: ${{ secrets.AMP_APP_PRIVATE_KEY }}
+
+      - name: Mint primary App token (best-effort)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ steps.amp-app-token.outputs.token || steps.app-token.outputs.token || secrets.GH_AMP_PAT || secrets.GH_DEST_PAT }}
+
+      - name: Setup AMP
+        uses: ./.github/actions/setup-amp
+        with:
+          # When these are set, amp installs from the private obfuscated wheel;
+          # unset (any of them) falls back to `pip install -e .`. The same three
+          # `with:` lines enable the wheel path in any other workflow.
+          dist-token: ${{ secrets.AMP_DIST_TOKEN }}
+          version: ${{ vars.AMP_VERSION }}
+          dist-repo: ${{ vars.AMP_DIST_REPO }}
+
+      - name: Resolve source org
+        id: resolve
+        run: |
+          ORG="${{ inputs.org }}"
+          if [ -z "$ORG" ]; then
+            ORG="${{ vars.DEFAULT_SOURCE_ORG }}"
+          fi
+          if [ -z "$ORG" ]; then
+            echo "::error::No source org provided and vars.DEFAULT_SOURCE_ORG is not set"
+            exit 1
+          fi
+          echo "org=$ORG" >> "$GITHUB_OUTPUT"
+
+      # Per-provider pre-flight: which inputs/secrets/vars are mandatory
+      # depends on the selected source. Each missing item is reported once
+      # to the run summary panel and as an inline ::error:: annotation.
+      - name: Validate inputs for selected source
+        env:
+          SOURCE: ${{ inputs.source }}
+          ORG: ${{ steps.resolve.outputs.org }}
+          PROJECT: ${{ inputs.project }}
+          TARGET_ORG: ${{ inputs.target_org }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          ADO_PAT: ${{ secrets.ADO_PAT }}
+          BBS_PAT: ${{ secrets.BBS_PAT }}
+          BBS_URL: ${{ vars.BBS_URL }}
+          BITBUCKET_API_TOKEN: ${{ secrets.BITBUCKET_API_TOKEN }}
+          BITBUCKET_EMAIL: ${{ vars.BITBUCKET_EMAIL }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_URL: ${{ vars.GITLAB_URL }}
+        run: |
+          set +e
+          missing=()
+
+          # Always required across all providers
+          [ -n "$ORG" ]        || missing+=("input \`org\` (or repo variable \`DEFAULT_SOURCE_ORG\`) — source org/group/project-collection")
+          [ -n "$TARGET_ORG" ] || missing+=("input \`target_org\` — destination GitHub org for \`dst-org:\` label")
+
+          case "$SOURCE" in
+            github)
+              [ -n "$GH_PAT" ] || missing+=("secret \`GH_PAT\` — source GitHub PAT with \`read:org\` and \`repo\`")
+              ;;
+            ado)
+              [ -n "$PROJECT" ] || missing+=("input \`project\` — ADO team project name (required for ADO source)")
+              [ -n "$ADO_PAT" ] || missing+=("secret \`ADO_PAT\` — Azure DevOps PAT with at least \`Project and Team (Read)\` and \`Code (Read)\` on the org")
+              ;;
+            bitbucket)
+              if [ -z "$BBS_URL" ] || [ "$BBS_URL" = "REPLACE_ME" ]; then
+                missing+=("repo variable \`BBS_URL\` — Bitbucket Server base URL (e.g. \`https://bitbucket.example.com\`)")
+              fi
+              [ -n "$BBS_PAT" ] || missing+=("secret \`BBS_PAT\` — Bitbucket Server PAT with project read access")
+              ;;
+            bitbucket-cloud)
+              [ -n "$BITBUCKET_API_TOKEN" ] || missing+=("secret \`BITBUCKET_API_TOKEN\` — Bitbucket Cloud API token with workspace + PR read scope")
+              [ -n "$BITBUCKET_EMAIL" ] || missing+=("repo variable \`BITBUCKET_EMAIL\` — email associated with the BITBUCKET_API_TOKEN (used as Basic auth username)")
+              ;;
+            gitlab)
+              if [ -z "$GITLAB_URL" ] || [ "$GITLAB_URL" = "REPLACE_ME" ]; then
+                missing+=("repo variable \`GITLAB_URL\` — GitLab base URL (e.g. \`https://gitlab.com\` or self-hosted)")
+              fi
+              [ -n "$GITLAB_TOKEN" ] || missing+=("secret \`GITLAB_TOKEN\` — GitLab token with \`read_api\` and \`read_repository\`")
+              ;;
+            *)
+              missing+=("input \`source\` — must be one of: github, ado, bitbucket, bitbucket-cloud, gitlab (got: \`$SOURCE\`)")
+              ;;
+          esac
+
+          if [ ${#missing[@]} -ne 0 ]; then
+            {
+              echo "## Pre-flight check failed"
+              echo ""
+              echo "Source provider \`$SOURCE\` requires the following before \`amp analyze\` can run:"
+              echo ""
+              for m in "${missing[@]}"; do
+                echo "- $m"
+              done
+              echo ""
+              echo "Fix the missing items (workflow inputs at dispatch time, or repo Secrets/Variables in Settings) and re-run."
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            for m in "${missing[@]}"; do
+              echo "::error title=Pre-flight ($SOURCE)::$m"
+            done
+            exit 1
+          fi
+
+          echo "Pre-flight OK for source=$SOURCE"
+
+      - name: Run analysis
+        run: |
+          amp --verbose analyze \
+            --source ${{ inputs.source }} \
+            --org "${{ steps.resolve.outputs.org }}" \
+            ${{ inputs.project && format('--project "{0}"', inputs.project) || '' }} \
+            --default-dst-org "${{ inputs.target_org }}" \
+            --repo ${{ github.repository }}
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_DEST_PAT: ${{ secrets.GH_DEST_PAT }}
+          GH_AMP_PAT: ${{ secrets.GH_AMP_PAT }}
+          GH_API_URL: ${{ vars.GH_API_URL }}
+          GH_DEST_API_URL: ${{ vars.GH_DEST_API_URL }}
+          GH_AMP_API_URL: ${{ vars.GH_AMP_API_URL }}
+          ADO_PAT: ${{ secrets.ADO_PAT }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_URL: ${{ vars.GITLAB_URL }}
+          BBS_PAT: ${{ secrets.BBS_PAT }}
+          BBS_URL: ${{ vars.BBS_URL }}
+          BITBUCKET_API_TOKEN: ${{ secrets.BITBUCKET_API_TOKEN }}
+          BITBUCKET_EMAIL: ${{ vars.BITBUCKET_EMAIL }}
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          DEST_APP_ID: ${{ secrets.DEST_APP_ID }}
+          DEST_APP_PRIVATE_KEY: ${{ secrets.DEST_APP_PRIVATE_KEY }}
+          AMP_APP_ID: ${{ secrets.AMP_APP_ID }}
+          AMP_APP_PRIVATE_KEY: ${{ secrets.AMP_APP_PRIVATE_KEY }}
+          AMP_DISABLE_DEFAULT_REPO_PREFIX: ${{ vars.AMP_DISABLE_DEFAULT_REPO_PREFIX }}
+          # When "true", skip discovering source teams and emitting src-team:*
+          # labels. Use on installs whose source (typically ADO) has enough
+          # project-level teams to push per-issue label counts past GitHub's
+          # cap of 100. Must match refresh.yml / issue-ops.yml.
+          AMP_DISABLE_SOURCE_TEAMS: ${{ vars.AMP_DISABLE_SOURCE_TEAMS }}
+          AMP_PROJECT_OWNER: ${{ vars.AMP_PROJECT_OWNER }}
+          AMP_PROJECT_NUMBER: ${{ vars.AMP_PROJECT_NUMBER }}

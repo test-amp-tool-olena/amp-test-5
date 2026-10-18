@@ -1,0 +1,90 @@
+# -----------------------------------------------------------------------------
+# Copyright (c) 2026 Xebia. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# This software, associated workflows, and configuration assets are the
+# proprietary property of Xebia. Possession or use of this software is
+# authorized strictly during an active professional services engagement with
+# Xebia and subject to the terms of the governing engagement agreement.
+#
+# Unauthorized copying, reverse engineering, redistribution, or continued use
+# after engagement termination is strictly prohibited.
+#
+# DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY:
+# THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL
+# XEBIA OR ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) ARISING IN ANY WAY OUT OF THE USE OF OR INABILITY TO USE THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# USAGE IS ENTIRELY AT YOUR OWN RISK.
+# -----------------------------------------------------------------------------
+
+name: Cleanup Skipped Runs
+run-name: Cleanup Skipped Runs
+
+# Skipped runs accumulate from `issue-ops.yml` (every comment that doesn't
+# start with `/`) and `post-migrate.yml` (every label-add other than
+# status:migrate-success). They're cosmetic but make the Actions UI noisy
+# when looking for the runs that matter.
+#
+# Manual-only safety valve. Routine cleanup piggybacks on the migration
+# queue dispatcher (see migration-dispatcher.yml) so it runs alongside work that
+# already needs to wake up — avoiding the parallel-invocation API-budget
+# blow-up that earlier event-driven cleanup caused (see commit db78588).
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: cleanup-skipped-runs
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  cleanup:
+    runs-on: ${{ fromJSON(vars.AMP_RUNNER_CLEANUP_SKIPPED_RUNS || vars.AMP_RUNNER || '"ubuntu-latest"') }}
+    steps:
+      # Mint App tokens for control-repo access. AMP App is the dedicated
+      # control-repo credential; primary App is back-compat fallback.
+      #
+      # With App auth the cleanup runs against the App's own 5K/hr budget
+      # rather than draining the PAT budget shared with migrations — the
+      # original motivation for splitting cleanup into its own workflow
+      # (see history note above). Falls back to PAT silently when not configured.
+      - name: Mint AMP App token (best-effort)
+        id: amp-app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.AMP_APP_ID }}
+          private-key: ${{ secrets.AMP_APP_PRIVATE_KEY }}
+
+      - name: Mint primary App token (best-effort)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ steps.amp-app-token.outputs.token || steps.app-token.outputs.token || secrets.GH_AMP_PAT || secrets.GH_DEST_PAT }}
+
+      - name: Delete skipped runs
+        uses: ./.github/actions/cleanup-skipped-runs
+        with:
+          github-token: ${{ steps.amp-app-token.outputs.token || steps.app-token.outputs.token || secrets.GH_AMP_PAT || secrets.GH_DEST_PAT }}
+          # Each label-add fan-outs into 10+ workflow runs (issue-ops fires
+          # once per comment label-ops posts, all but one of which skip
+          # because the body doesn't start with `/`). The 200-default cap
+          # couldn't drain a busy day's backlog. 2000 stays well under the
+          # 5K/hr PAT budget (the action breaks early on 429), and the
+          # rate-limit guard already protects against runaway delete bursts.
+          limit: "2000"

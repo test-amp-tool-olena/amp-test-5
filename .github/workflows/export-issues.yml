@@ -1,0 +1,89 @@
+# -----------------------------------------------------------------------------
+# Copyright (c) 2026 Xebia. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# This software, associated workflows, and configuration assets are the
+# proprietary property of Xebia. Possession or use of this software is
+# authorized strictly during an active professional services engagement with
+# Xebia and subject to the terms of the governing engagement agreement.
+#
+# Unauthorized copying, reverse engineering, redistribution, or continued use
+# after engagement termination is strictly prohibited.
+#
+# DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY:
+# THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL
+# XEBIA OR ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) ARISING IN ANY WAY OUT OF THE USE OF OR INABILITY TO USE THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# USAGE IS ENTIRELY AT YOUR OWN RISK.
+# -----------------------------------------------------------------------------
+
+name: Export Issues
+run-name: "Export Issues to CSV"
+
+on:
+  schedule:
+    - cron: "0 17 * * 1-5"  # 5pm UTC weekdays (before daily report)
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  export:
+    runs-on: ${{ fromJSON(vars.AMP_RUNNER_EXPORT_ISSUES || vars.AMP_RUNNER || '"ubuntu-latest"') }}
+
+    steps:
+      # Mint App tokens for control-repo access. AMP App is the dedicated
+      # control-repo credential; primary App is back-compat fallback.
+      - name: Mint AMP App token (best-effort)
+        id: amp-app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.AMP_APP_ID }}
+          private-key: ${{ secrets.AMP_APP_PRIVATE_KEY }}
+
+      - name: Mint primary App token (best-effort)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ steps.amp-app-token.outputs.token || steps.app-token.outputs.token || secrets.GH_AMP_PAT || secrets.GH_DEST_PAT }}
+
+      - name: Setup AMP
+        uses: ./.github/actions/setup-amp
+        with:
+          dist-token: ${{ secrets.AMP_DIST_TOKEN }}
+          version:    ${{ vars.AMP_VERSION }}
+          dist-repo:  ${{ vars.AMP_DIST_REPO }}
+
+      - name: Export issues to CSV
+        run: python3 scripts/export-issues.py "${{ github.repository_owner }}" "${GITHUB_REPOSITORY#*/}" --post
+        env:
+          GH_AMP_PAT: ${{ secrets.GH_AMP_PAT }}
+          GH_AMP_API_URL: ${{ vars.GH_AMP_API_URL }}
+          AMP_APP_ID: ${{ secrets.AMP_APP_ID }}
+          AMP_APP_PRIVATE_KEY: ${{ secrets.AMP_APP_PRIVATE_KEY }}
+          GH_DEST_PAT: ${{ secrets.GH_DEST_PAT }}
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          DEST_APP_ID: ${{ secrets.DEST_APP_ID }}
+          DEST_APP_PRIVATE_KEY: ${{ secrets.DEST_APP_PRIVATE_KEY }}
+
+      - name: Upload CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: issues-export-${{ github.run_id }}
+          path: output/issues_export.csv
+          retention-days: 90

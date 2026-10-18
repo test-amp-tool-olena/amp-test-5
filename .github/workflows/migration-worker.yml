@@ -1,0 +1,329 @@
+# -----------------------------------------------------------------------------
+# Copyright (c) 2026 Xebia. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# This software, associated workflows, and configuration assets are the
+# proprietary property of Xebia. Possession or use of this software is
+# authorized strictly during an active professional services engagement with
+# Xebia and subject to the terms of the governing engagement agreement.
+#
+# Unauthorized copying, reverse engineering, redistribution, or continued use
+# after engagement termination is strictly prohibited.
+#
+# DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY:
+# THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL
+# XEBIA OR ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) ARISING IN ANY WAY OUT OF THE USE OF OR INABILITY TO USE THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# USAGE IS ENTIRELY AT YOUR OWN RISK.
+# -----------------------------------------------------------------------------
+
+name: Migration Worker
+run-name: "${{ inputs.command }} → #${{ inputs.issue }}${{ inputs.title && format(' {0}', inputs.title) || '' }}"
+
+# One queued operation per workflow run. The dispatcher (migration-dispatcher.yml)
+# is the only thing that fires this — it claimed a slot, swapped status:*-queued
+# to status:*-running on the issue, and now this run does the actual GEI work.
+# On success/failure the handler stamps the terminal status:*-success
+# or status:*-failed label, which frees the slot for the next dispatcher tick.
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: "Issue number to run"
+        required: true
+        type: number
+      command:
+        description: "Which command to run (run-migrate | run-dryrun | run-remigrate)"
+        required: true
+        type: choice
+        options:
+          - run-migrate
+          - run-dryrun
+          - run-remigrate
+      title:
+        description: "Issue title (for run-name; dispatcher fills this in)"
+        required: false
+        type: string
+        default: ""
+      dispatcher_comment_id:
+        description: "ID of the dispatcher's 'claimed slot' comment to append to (set by the dispatcher; leave blank for manual runs)"
+        required: false
+        type: string
+        default: ""
+      runner_label_override:
+        description: "JSON-encoded runner label (e.g. '\"ubuntu-22.04-16core\"' or '[\"self-hosted\",\"large\"]'). Empty falls through to AMP_RUNNER_* vars. Dispatcher sets this when the issue carries lfs:large or size:huge and vars.AMP_RUNNER_MIGRATION_WORKER_LARGE is configured."
+        required: false
+        type: string
+        default: ""
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  execute:
+    # AMP_RUNNER_SLOT_RUNNER is the legacy var name (this workflow used to be
+    # called Slot Runner); kept as a fallback so existing installs don't lose
+    # their runner override on rename.
+    # `runner_label_override` is set by the dispatcher when the queued issue has
+    # `lfs:large` or `size:huge` and `vars.AMP_RUNNER_MIGRATION_WORKER_LARGE` is
+    # configured — explicit `!= ''` ternary because empty inputs can short-
+    # circuit truthy in some GHA-expression edge cases.
+    runs-on: ${{ fromJSON(inputs.runner_label_override != '' && inputs.runner_label_override || vars.AMP_RUNNER_MIGRATION_WORKER || vars.AMP_RUNNER_SLOT_RUNNER || vars.AMP_RUNNER || '"ubuntu-latest"') }}
+
+    steps:
+      # Mint App tokens for control-repo access. AMP App is the dedicated
+      # control-repo credential; primary App is back-compat fallback.
+      - name: Mint AMP App token (best-effort)
+        id: amp-app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.AMP_APP_ID }}
+          private-key: ${{ secrets.AMP_APP_PRIVATE_KEY }}
+
+      - name: Mint primary App token (best-effort)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ steps.amp-app-token.outputs.token || steps.app-token.outputs.token || secrets.GH_AMP_PAT || secrets.GH_DEST_PAT }}
+
+      - name: Setup AMP
+        uses: ./.github/actions/setup-amp
+        with:
+          dist-token: ${{ secrets.AMP_DIST_TOKEN }}
+          version:    ${{ vars.AMP_VERSION }}
+          dist-repo:  ${{ vars.AMP_DIST_REPO }}
+          extensions: gei,ado2gh,bbs2gh,bbc
+          # Optional github.com PAT (no scopes) raises api.github.com from
+          # 60/hr anon to 5000/hr authenticated — needed when many workers
+          # share a runner egress IP. Falls back to anonymous if unset.
+          github-com-token: ${{ secrets.GH_COM_TOKEN }}
+
+      # Pre-flight: confirm the LFS storage volume has enough headroom for
+      # this repo's `git lfs fetch --all`. Catches "no space left on device"
+      # before any amp code runs and surfaces a clear annotation on the run
+      # plus a comment on the issue. The matching Python-side gate in
+      # `_fetch_then_push_lfs` covers callers outside this workflow.
+      - name: Pre-flight LFS disk check
+        env:
+          GH_TOKEN: ${{ steps.amp-app-token.outputs.token || steps.app-token.outputs.token || secrets.GH_AMP_PAT || secrets.GH_DEST_PAT }}
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ inputs.issue }}
+          CMD: ${{ inputs.command }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          AMP_LFS_STORAGE_DIR: ${{ vars.AMP_LFS_STORAGE_DIR || '/mnt/amp-lfs' }}
+          HEADROOM: ${{ vars.AMP_LFS_DISK_HEADROOM_FACTOR || '1.5' }}
+          # The dispatcher already stamped status:*-running before invoking
+          # this worker. If we exit non-zero from pre-flight, the Python
+          # handler never runs, so nothing else rolls the state machine
+          # forward — and the reconciler would re-queue the issue on its
+          # next tick. Map command → which running label to roll back to a
+          # terminal *-failed so the operator gets a clear stop instead of
+          # a re-queue loop.
+          RUNNING_LABEL: ${{ (inputs.command == 'run-dryrun') && 'status:dryrun-running' || 'status:migrate-running' }}
+          FAILED_LABEL: ${{ (inputs.command == 'run-dryrun') && 'status:dryrun-failed' || 'status:migrate-failed' }}
+        run: |
+          set -euo pipefail
+          export GH_HOST="${GITHUB_SERVER_URL#https://}"
+          # /mnt on hosted ubuntu runners is root-owned (it's the Azure
+          # ephemeral disk mounted by the image). Plain `mkdir -p` fails
+          # with EACCES; fall back to passwordless sudo to claim the dir
+          # for the runner user. On self-hosted runners that already have
+          # a writable path, the first mkdir succeeds and sudo never runs.
+          if ! mkdir -p "$AMP_LFS_STORAGE_DIR" 2>/dev/null || [ ! -w "$AMP_LFS_STORAGE_DIR" ]; then
+            echo "$AMP_LFS_STORAGE_DIR not user-writable; claiming via sudo."
+            sudo mkdir -p "$AMP_LFS_STORAGE_DIR"
+            sudo chown -R "$(id -u):$(id -g)" "$AMP_LFS_STORAGE_DIR"
+          fi
+          echo "Free space at $AMP_LFS_STORAGE_DIR:"
+          df -h "$AMP_LFS_STORAGE_DIR"
+
+          BODY=$(gh issue view "$ISSUE" -R "$REPO" --json body --jq .body)
+          # Must match both row variants emitted by amp/analyze/lfs.py:123 and
+          # :130 — "LFS storage (across history)" (when historical bytes were
+          # counted) and "LFS storage (HEAD)" (fallback) — plus the bare
+          # "LFS storage" form for legacy issue bodies. Keep the optional
+          # parenthetical group in sync with that file if the column is renamed.
+          bytes=$(BODY="$BODY" python3 -c '
+          import os, re
+          body = os.environ.get("BODY", "")
+          m = re.search(r"\|\s*LFS storage(?:\s*\([^)]+\))?\s*\|\s*([\d.]+)\s*([KMGT]?B)\s*\|", body)
+          if not m:
+              print(0)
+          else:
+              mul = {"B":1,"KB":1024,"MB":1024**2,"GB":1024**3,"TB":1024**4}[m.group(2)]
+              print(int(float(m.group(1)) * mul))
+          ')
+          if [ "$bytes" -eq 0 ]; then
+            echo "No LFS storage line in issue body — skipping pre-flight."
+            exit 0
+          fi
+
+          free=$(df --output=avail -B1 "$AMP_LFS_STORAGE_DIR" | tail -1 | tr -d ' ')
+          needed=$(python3 -c "import math; print(math.ceil($bytes * $HEADROOM))")
+
+          human() { numfmt --to=iec --suffix=B "$1"; }
+          echo "LFS payload: $(human "$bytes"); headroom: ${HEADROOM}x; needed: $(human "$needed"); free: $(human "$free")"
+
+          if [ "$needed" -gt "$free" ]; then
+            gh issue comment "$ISSUE" -R "$REPO" --body \
+              "❌ LFS pre-flight failed for [\`$CMD\`]($RUN_URL): need $(human "$needed") at \`$AMP_LFS_STORAGE_DIR\` (${HEADROOM}× of $(human "$bytes") LFS payload), only $(human "$free") free. Point \`vars.AMP_LFS_STORAGE_DIR\` at a larger volume and re-queue."
+            # Roll back the running label the dispatcher applied so the
+            # reconciler doesn't see a stuck *-running and loop us back into
+            # the queue. Best-effort — a failure here shouldn't mask the
+            # underlying pre-flight failure.
+            gh issue edit "$ISSUE" -R "$REPO" --remove-label "$RUNNING_LABEL" --add-label "$FAILED_LABEL" || true
+            echo "::error::LFS pre-flight failed: need $needed bytes, free $free bytes at $AMP_LFS_STORAGE_DIR"
+            exit 1
+          fi
+
+      # Surface a link to THIS worker run on the issue thread. When the
+      # dispatcher passed its comment ID, append to that comment so the
+      # dispatcher's "claimed slot" line and the worker's "Started …" line
+      # live in one comment instead of two. Falls back to a fresh comment
+      # for manual workflow_dispatch runs (no dispatcher comment to extend).
+      - name: Post "Started" comment
+        env:
+          GH_TOKEN: ${{ steps.amp-app-token.outputs.token || steps.app-token.outputs.token || secrets.GH_AMP_PAT || secrets.GH_DEST_PAT }}
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ inputs.issue }}
+          CMD: ${{ inputs.command }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID: ${{ github.run_id }}
+          DISPATCHER_COMMENT_ID: ${{ inputs.dispatcher_comment_id }}
+        run: |
+          export GH_HOST="${GITHUB_SERVER_URL#https://}"
+          STARTED="Started [\`$CMD\`]($RUN_URL) — running…"
+          if [[ -n "$DISPATCHER_COMMENT_ID" ]]; then
+            EXISTING=$(gh api "/repos/$REPO/issues/comments/$DISPATCHER_COMMENT_ID" --jq .body)
+            NEW_BODY=$(printf '%s\n\n%s' "$EXISTING" "$STARTED")
+            gh api -X PATCH "/repos/$REPO/issues/comments/$DISPATCHER_COMMENT_ID" -f "body=$NEW_BODY" >/dev/null
+          else
+            gh issue comment "$ISSUE" -R "$REPO" --body "$STARTED"
+          fi
+
+      - name: Execute command
+        id: execute
+        continue-on-error: true
+        run: |
+          # Issue URL banner (matches issue-ops.yml's pattern). The %2D dance
+          # bypasses GH's secret-masker on org slugs that overlap with secrets.
+          URL_SAFE="${ISSUE_URL//-/%2D}"
+          trap 'echo ""; echo "::notice::Issue: $URL_SAFE"' EXIT
+          echo "Issue: $URL_SAFE"
+          echo ""
+
+          python3 -m amp.commands \
+            --command "${{ inputs.command }}" \
+            --args "" \
+            --issue-number ${{ inputs.issue }} \
+            --repo ${{ github.repository }}
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_DEST_PAT: ${{ secrets.GH_DEST_PAT }}
+          GH_AMP_PAT: ${{ secrets.GH_AMP_PAT }}
+          GH_API_URL: ${{ vars.GH_API_URL }}
+          GH_DEST_API_URL: ${{ vars.GH_DEST_API_URL }}
+          GH_AMP_API_URL: ${{ vars.GH_AMP_API_URL }}
+          ADO_PAT: ${{ secrets.ADO_PAT }}
+          # GitLab migration source — gl-exporter Docker export + GraphQL
+          # import. GL_EXPORTER_IMAGE should be a registry ref the runner can
+          # pull (gl-exporter is not on a public registry); unset → the
+          # `gl-exporter:1.7.14` local tag, which a self-hosted runner must
+          # pre-build. AZURE_STORAGE_CONNECTION_STRING unset → the archive
+          # goes to GitHub-owned blob storage (no external account).
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_URL: ${{ vars.GITLAB_URL }}
+          GITLAB_API_URL: ${{ vars.GITLAB_API_URL }}
+          GL_EXPORTER_IMAGE: ${{ vars.GL_EXPORTER_IMAGE }}
+          GL_EXPORTER_DOCKER_NETWORK: ${{ vars.GL_EXPORTER_DOCKER_NETWORK }}
+          AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+          # Bitbucket Cloud source — gh bbc-exporter reads these env vars
+          # directly (BITBUCKET_API_TOKEN for the scoped API token + BITBUCKET_EMAIL
+          # as the Basic-auth username). Without them, the exporter falls back
+          # to ambient gh auth and rejects the migrate with "authentication
+          # credentials required". Mirror analyze.yml / issue-ops.yml /
+          # refresh.yml so the worker sees the same BBC source creds as the
+          # other entry points.
+          BITBUCKET_API_TOKEN: ${{ secrets.BITBUCKET_API_TOKEN }}
+          BITBUCKET_EMAIL: ${{ vars.BITBUCKET_EMAIL }}
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          DEST_APP_ID: ${{ secrets.DEST_APP_ID }}
+          DEST_APP_PRIVATE_KEY: ${{ secrets.DEST_APP_PRIVATE_KEY }}
+          AMP_APP_ID: ${{ secrets.AMP_APP_ID }}
+          AMP_APP_PRIVATE_KEY: ${{ secrets.AMP_APP_PRIVATE_KEY }}
+          SANDBOX_ORG: ${{ vars.SANDBOX_ORG }}
+          # Worker deliberately does NOT pass AMP_QUEUE_ENABLED — the
+          # run-* commands always bypass the queue (they ARE the queue's
+          # work loop), so the flag must not influence them.
+          # Mirror analyze.yml / issue-ops.yml so the run-* handlers see the
+          # same default-prefix policy as the rest of AMP. Worker handlers
+          # don't refresh today, but a future migrate-time re-analysis would
+          # silently re-add `dst-prefix:<default>` without this.
+          AMP_DISABLE_DEFAULT_REPO_PREFIX: ${{ vars.AMP_DISABLE_DEFAULT_REPO_PREFIX }}
+          AMP_PROJECT_OWNER: ${{ vars.AMP_PROJECT_OWNER }}
+          AMP_PROJECT_NUMBER: ${{ vars.AMP_PROJECT_NUMBER }}
+          ISSUE_URL: ${{ github.server_url }}/${{ github.repository }}/issues/${{ inputs.issue }}
+          # LFS storage redirect: heavy git-lfs fetch+push (in
+          # `_fetch_then_push_lfs`) writes objects under this dir so the
+          # default `.git/lfs/` under `/tmp` doesn't fill up. Mirrors the
+          # pre-flight env above so both checks target the same volume.
+          AMP_LFS_STORAGE_DIR: ${{ vars.AMP_LFS_STORAGE_DIR || '/mnt/amp-lfs' }}
+          # Mirror Python's `amp` logger to a file the advisor can read.
+          # The "AI Failure Analysis" step below reads `logs/*.log` to
+          # diagnose failures; without this the advisor only sees
+          # `logs/migration_result.txt` ("Failed") and the verifier dump,
+          # missing the per-object LFS fetch/push diagnostics emitted via
+          # `log.info` / `log.warning`.
+          AMP_LOG_FILE: logs/amp.log
+
+      - name: AI Failure Analysis
+        if: steps.execute.outcome == 'failure'
+        run: |
+          python3 -m amp.ai.advisor \
+            --issue-number ${{ inputs.issue }} \
+            --repo ${{ github.repository }} \
+            --logs-dir logs/ \
+            --repair-mode
+        env:
+          GH_DEST_PAT: ${{ secrets.GH_DEST_PAT }}
+          GH_AMP_PAT: ${{ secrets.GH_AMP_PAT }}
+          MODELS_TOKEN: ${{ secrets.MODELS_TOKEN }}
+          ADO_PAT: ${{ secrets.ADO_PAT }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_API_URL: ${{ vars.GH_API_URL }}
+          GH_DEST_API_URL: ${{ vars.GH_DEST_API_URL }}
+          GH_AMP_API_URL: ${{ vars.GH_AMP_API_URL }}
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          DEST_APP_ID: ${{ secrets.DEST_APP_ID }}
+          DEST_APP_PRIVATE_KEY: ${{ secrets.DEST_APP_PRIVATE_KEY }}
+          AMP_APP_ID: ${{ secrets.AMP_APP_ID }}
+          AMP_APP_PRIVATE_KEY: ${{ secrets.AMP_APP_PRIVATE_KEY }}
+          SANDBOX_ORG: ${{ vars.SANDBOX_ORG }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-worker-logs-${{ inputs.issue }}
+          path: logs/
+          retention-days: 30
+
+      - name: Fail job if execute failed
+        if: steps.execute.outcome == 'failure'
+        run: exit 1

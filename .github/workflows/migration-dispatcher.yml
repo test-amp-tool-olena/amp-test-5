@@ -1,0 +1,239 @@
+# -----------------------------------------------------------------------------
+# Copyright (c) 2026 Xebia. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# This software, associated workflows, and configuration assets are the
+# proprietary property of Xebia. Possession or use of this software is
+# authorized strictly during an active professional services engagement with
+# Xebia and subject to the terms of the governing engagement agreement.
+#
+# Unauthorized copying, reverse engineering, redistribution, or continued use
+# after engagement termination is strictly prohibited.
+#
+# DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY:
+# THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL
+# XEBIA OR ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) ARISING IN ANY WAY OUT OF THE USE OF OR INABILITY TO USE THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# USAGE IS ENTIRELY AT YOUR OWN RISK.
+# -----------------------------------------------------------------------------
+
+name: Migration Dispatcher
+
+# Drains the migration queue without exceeding GitHub's concurrent-migration cap.
+# Cron-pull, not webhook-driven: labels are state, not triggers — the dispatcher
+# reads current state on every wake and decides what to do, regardless of which
+# event woke it. Single-flight `concurrency:` prevents double-claim.
+#
+# Triggers (cheapest first):
+#   - issues:labeled with one of the queue labels (drain immediately)
+#   - workflow_run completion of Migration Worker (free a slot, fill it)
+#   - schedule hourly weekdays (safety net for missed events + reconciler;
+#     OFF by default — opt in per-install with AMP_DISPATCHER_CRON_ENABLED=true)
+#   - workflow_dispatch (manual operator override)
+
+on:
+  issues:
+    types: [labeled]
+  workflow_run:
+    workflows: ["Migration Worker"]
+    types: [completed]
+  schedule:
+    - cron: "0 * * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: amp-queue-dispatcher
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    # Skipped jobs are unbilled. Three gates:
+    # 1. Feature flag must not be explicitly off (default on — opt out with
+    #    AMP_QUEUE_ENABLED=false for byte-identical legacy behavior).
+    # 2. Schedule trigger is opt-in: cron only fires when
+    #    AMP_DISPATCHER_CRON_ENABLED == 'true' (strict literal). Event-driven
+    #    triggers (issues:labeled, workflow_run, workflow_dispatch) ignore this
+    #    gate — they always run when feature flag #1 allows. Cron defaults OFF
+    #    because the safety-net reconciler's cost is low (manual
+    #    workflow_dispatch on a stuck issue) but background ticks on every
+    #    install are noisy.
+    # 3. If triggered by a labeled event, only fire on queue-relevant labels.
+    if: >-
+      vars.AMP_QUEUE_ENABLED != 'false' &&
+      (github.event_name != 'schedule' || vars.AMP_DISPATCHER_CRON_ENABLED == 'true') &&
+      (
+        github.event_name != 'issues' ||
+        github.event.label.name == 'status:migrate-queued' ||
+        github.event.label.name == 'status:dryrun-queued' ||
+        github.event.label.name == 'cmd-pending:remigrate'
+      )
+    # AMP_RUNNER_DISPATCH_QUEUE is the legacy var name (this workflow used
+    # to be called Migration Queue Dispatcher); kept as a fallback so
+    # existing installs don't lose their runner override on rename.
+    runs-on: ${{ fromJSON(vars.AMP_RUNNER_MIGRATION_DISPATCHER || vars.AMP_RUNNER_DISPATCH_QUEUE || vars.AMP_RUNNER || '"ubuntu-latest"') }}
+    steps:
+      # Mint App tokens for control-repo access. AMP App is the dedicated
+      # control-repo credential; primary App is back-compat fallback.
+      #
+      # The dispatcher fires on every queue-relevant labeled event plus an
+      # opt-in hourly weekday cron, so its `gh issue list/edit` calls add up;
+      # routing those through App auth gives them a separate budget from
+      # migrations. Falls back to PAT silently when secrets are unset.
+      - name: Mint AMP App token (best-effort)
+        id: amp-app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.AMP_APP_ID }}
+          private-key: ${{ secrets.AMP_APP_PRIVATE_KEY }}
+
+      - name: Mint primary App token (best-effort)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ steps.amp-app-token.outputs.token || steps.app-token.outputs.token || secrets.GH_AMP_PAT || secrets.GH_DEST_PAT }}
+
+      - name: Resolve cap
+        id: cap
+        run: |
+          CAP="${{ vars.AMP_MIGRATE_CONCURRENCY }}"
+          [[ "$CAP" =~ ^[0-9]+$ ]] || CAP=10
+          echo "cap=$CAP" >> "$GITHUB_OUTPUT"
+          echo "Concurrency cap: $CAP"
+
+      - name: Reconcile stuck running issues
+        env:
+          GH_TOKEN: ${{ steps.amp-app-token.outputs.token || steps.app-token.outputs.token || secrets.GH_AMP_PAT || secrets.GH_DEST_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          # gh defaults to github.com; on GHE-DR/GHES the control repo lives
+          # on the workflow's own tenant. Strip the scheme from the auto-set
+          # GITHUB_SERVER_URL to get the bare hostname gh expects.
+          export GH_HOST="${GITHUB_SERVER_URL#https://}"
+          ./scripts/reconcile-queue.sh
+
+      - name: Compute slots and claim queued issues
+        env:
+          GH_TOKEN: ${{ steps.amp-app-token.outputs.token || steps.app-token.outputs.token || secrets.GH_AMP_PAT || secrets.GH_DEST_PAT }}
+          REPO: ${{ github.repository }}
+          CAP: ${{ steps.cap.outputs.cap }}
+          DISPATCHER_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # gh defaults to github.com; route to the workflow's own tenant
+          # so gh CLI calls hit the right control-repo API.
+          export GH_HOST="${GITHUB_SERVER_URL#https://}"
+
+          # Migration cap is shared across migrate + dryrun (same GitHub-side queue).
+          MIG_R=$(gh issue list -R "$REPO" --label "status:migrate-running" --state open --limit 100 --json number | jq length)
+          DRY_R=$(gh issue list -R "$REPO" --label "status:dryrun-running" --state open --limit 100 --json number | jq length)
+          RUNNING=$((MIG_R + DRY_R))
+          SLOTS=$((CAP - RUNNING))
+          echo "Running: migrate=$MIG_R dryrun=$DRY_R total=$RUNNING; slots available: $SLOTS"
+          if [[ $SLOTS -le 0 ]]; then
+            echo "Cap reached — nothing to claim this tick."
+            exit 0
+          fi
+
+          # Merge both queues, oldest first by createdAt.
+          QUEUED_JSON=$({
+            gh issue list -R "$REPO" --label "status:migrate-queued" --state open --limit 100 --json number,title,labels,createdAt
+            gh issue list -R "$REPO" --label "status:dryrun-queued" --state open --limit 100 --json number,title,labels,createdAt
+          } | jq -s 'add | sort_by(.createdAt) | .[0:'"$SLOTS"']')
+
+          COUNT=$(echo "$QUEUED_JSON" | jq length)
+          echo "Claiming $COUNT issue(s)."
+
+          echo "$QUEUED_JSON" | jq -c '.[]' | while read -r ROW; do
+            N=$(echo "$ROW" | jq -r '.number')
+            TITLE=$(echo "$ROW" | jq -r '.title')
+            LABELS=$(echo "$ROW" | jq -r '[.labels[].name] | join(" ")')
+
+            if [[ " $LABELS " == *" cmd-pending:remigrate "* ]]; then
+              CMD=run-remigrate
+              QLABEL=status:migrate-queued
+              RLABEL=status:migrate-running
+              gh issue edit "$N" -R "$REPO" --remove-label "cmd-pending:remigrate"
+            elif [[ " $LABELS " == *" status:dryrun-queued "* ]]; then
+              CMD=run-dryrun
+              QLABEL=status:dryrun-queued
+              RLABEL=status:dryrun-running
+            else
+              CMD=run-migrate
+              QLABEL=status:migrate-queued
+              RLABEL=status:migrate-running
+            fi
+
+            gh issue edit "$N" -R "$REPO" --remove-label "$QLABEL" --add-label "$RLABEL"
+
+            # Size-aware runner routing: a repo with `lfs:large` (LFS payload
+            # over AMP_LFS_LARGE_THRESHOLD_BYTES) or `size:huge` (total repo
+            # bytes over the size-tier cap) gets the large-runner override when
+            # the operator has wired one. Empty OVERRIDE → worker's `runs-on:`
+            # ternary falls through to AMP_RUNNER_MIGRATION_WORKER / default.
+            OVERRIDE=""
+            if [[ " $LABELS " == *" lfs:large "* || " $LABELS " == *" size:huge "* ]]; then
+              OVERRIDE="${{ vars.AMP_RUNNER_MIGRATION_WORKER_LARGE || '' }}"
+              # The worker passes this to `fromJSON()` for `runs-on:`, so it
+              # must be valid JSON — a quoted string `"ubuntu-22.04-16core"`
+              # or an array `["self-hosted","large"]`. Operators routinely set
+              # the var as a bare value (e.g. `ubuntu-latest-8-cores`), which
+              # causes the worker run to fail at startup with "workflow file
+              # issue" — no job ever starts, no logs, the queued issue silently
+              # never makes progress. Normalize defensively here so the
+              # operator-error case still dispatches a working worker.
+              if [[ -n "$OVERRIDE" && "$OVERRIDE" != \"* && "$OVERRIDE" != \[* ]]; then
+                if [[ "$OVERRIDE" == *,* ]]; then
+                  OVERRIDE=$(printf '%s' "$OVERRIDE" | jq -Rc 'split(",") | map(gsub("^\\s+|\\s+$";""))')
+                else
+                  OVERRIDE=$(printf '%s' "$OVERRIDE" | jq -Rc .)
+                fi
+              fi
+            fi
+
+            # Try to PATCH the initial "Queued for …" comment (posted by the
+            # enqueue handler in amp/commands/__init__.py with a hidden
+            # `<!-- amp-queue-pending -->` marker) so the dispatcher and worker
+            # extend a single comment instead of posting two follow-ups. Fall
+            # back to a fresh comment when no marker is found (queue bypassed,
+            # comment deleted, manual workflow_dispatch). The marker is
+            # rewritten to `amp-queue-claimed` so a subsequent tick can't
+            # re-match the same comment.
+            BODY="Dispatcher [run #${{ github.run_id }}]($DISPATCHER_RUN_URL): claimed slot, dispatching \`$CMD\`."
+            CID=$(gh api --paginate "/repos/$REPO/issues/$N/comments" \
+              --jq '[.[] | select(.body | contains("<!-- amp-queue-pending -->"))] | last | .id // empty')
+            if [[ -n "$CID" ]]; then
+              EXISTING=$(gh api "/repos/$REPO/issues/comments/$CID" --jq .body)
+              UPDATED=${EXISTING//<!-- amp-queue-pending -->/<!-- amp-queue-claimed -->}
+              NEW_BODY=$(printf '%s\n\n%s' "$UPDATED" "$BODY")
+              gh api -X PATCH "/repos/$REPO/issues/comments/$CID" -f "body=$NEW_BODY" >/dev/null
+            else
+              CID=$(gh api -X POST "/repos/$REPO/issues/$N/comments" -f "body=$BODY" --jq .id)
+            fi
+            gh workflow run migration-worker.yml -R "$REPO" -f issue="$N" -f command="$CMD" -f title="$TITLE" -f dispatcher_comment_id="$CID" -f runner_label_override="$OVERRIDE"
+            echo "Claimed #$N → $CMD${OVERRIDE:+ (runner: $OVERRIDE)}"
+          done
+
+      - name: Delete skipped runs
+        uses: ./.github/actions/cleanup-skipped-runs
+        with:
+          github-token: ${{ steps.amp-app-token.outputs.token || steps.app-token.outputs.token || secrets.GH_AMP_PAT || secrets.GH_DEST_PAT }}
+          # Each label-add fan-outs into 10+ workflow runs (issue-ops fires
+          # once per comment label-ops posts, all but one of which skip
+          # because the body doesn't start with `/`). The 200-default cap
+          # couldn't drain a busy day's backlog. 2000 stays well under the
+          # 5K/hr PAT budget (the action breaks early on 429), and the
+          # rate-limit guard already protects against runaway delete bursts.
+          limit: "2000"

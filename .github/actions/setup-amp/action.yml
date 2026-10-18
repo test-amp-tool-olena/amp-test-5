@@ -1,0 +1,190 @@
+# -----------------------------------------------------------------------------
+# Copyright (c) 2026 Xebia. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# This software, associated workflows, and configuration assets are the
+# proprietary property of Xebia. Possession or use of this software is
+# authorized strictly during an active professional services engagement with
+# Xebia and subject to the terms of the governing engagement agreement.
+#
+# Unauthorized copying, reverse engineering, redistribution, or continued use
+# after engagement termination is strictly prohibited.
+#
+# DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY:
+# THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL
+# XEBIA OR ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) ARISING IN ANY WAY OUT OF THE USE OF OR INABILITY TO USE THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# USAGE IS ENTIRELY AT YOUR OWN RISK.
+# -----------------------------------------------------------------------------
+
+name: Setup AMP
+description: Idempotently provision Python, the amp CLI (from compiled wheel), gh CLI, and gh extensions. Safe on both GitHub-hosted and self-hosted runners (bare or pre-provisioned). Requires dist-token, version, and dist-repo inputs.
+
+inputs:
+  python-version:
+    description: "Python version for actions/setup-python."
+    required: false
+    default: "3.11"
+  extensions:
+    description: "Comma-separated list of gh extensions to ensure installed. Recognized names: gei, ado2gh, bbs2gh, bbc."
+    required: false
+    default: ""
+  install-gh:
+    description: "Provision the gh CLI (probe + download from cli/cli releases if missing). Always needed for wheel installation. Set to 'false' only for non-default scenarios (always overridden to true when the wheel-distribution path is active, since Install amp CLI step invokes `gh release download` to pull the private wheel)."
+    required: false
+    default: "true"
+  gh-token:
+    description: "Ignored. Historically a tenant token; passing it does nothing now. Use `github-com-token` for authenticated api.github.com calls."
+    required: false
+  github-com-token:
+    description: "Optional github.com PAT (no scopes required) used ONLY to authenticate api.github.com calls for the gh CLI release lookup and gh extension installs. Raises the rate limit from 60/hr (anonymous, shared IP) to 5000/hr. Must be a github.com token — not a GHEC-DR / tenant token."
+    required: false
+  dist-token:
+    description: "Token with contents:read on the private wheel-distribution repo (a read-scoped fine-grained PAT or App install token). Required for wheel install. Revoking this token is the engagement-end kill switch."
+    required: true
+  version:
+    description: "amp version to install from the distribution repo (e.g. 0.1.0; the release tag is v<version>). Required for wheel install."
+    required: true
+  dist-repo:
+    description: "owner/repo of the private wheel-distribution release host (e.g. xebia/amp-dist). Required for wheel install."
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: pip
+
+    - name: Ensure gh CLI
+      # Wheel installation requires gh to download the release, so we always need it.
+      shell: bash
+      env:
+        GH_COM_TOKEN: ${{ inputs.github-com-token }}
+      # Hosted runners ship gh. Self-hosted runners may not — probe and install
+      # only if missing. Direct binary download from cli/cli releases avoids
+      # sudo/apt and third-party actions; works on locked-down nodes as long
+      # as github.com egress is allowed. Air-gapped runners should pre-bake gh
+      # onto the image; this step short-circuits via the `command -v` guard.
+      run: |
+        set -euo pipefail
+        if command -v gh >/dev/null 2>&1; then
+          echo "gh CLI already present: $(gh --version | head -n1)"
+          exit 0
+        fi
+        echo "gh CLI not found — downloading from cli/cli releases."
+        arch=$(uname -m)
+        case "$arch" in
+          x86_64) arch=amd64 ;;
+          aarch64|arm64) arch=arm64 ;;
+          *) echo "::error::Unsupported architecture: $arch"; exit 1 ;;
+        esac
+        os=$(uname -s | tr '[:upper:]' '[:lower:]')
+        # Resolve the latest release tag. Authenticate when a github.com PAT
+        # is provided so we get the 5000/hr rate limit instead of 60/hr anon.
+        if [ -n "${GH_COM_TOKEN:-}" ]; then
+          tag=$(curl -fsSL -H "Authorization: Bearer $GH_COM_TOKEN" https://api.github.com/repos/cli/cli/releases/latest | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/')
+        else
+          tag=$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/')
+        fi
+        if [ -z "$tag" ]; then
+          echo "::error::Could not resolve latest gh release tag."
+          exit 1
+        fi
+        url="https://github.com/cli/cli/releases/download/v${tag}/gh_${tag}_${os}_${arch}.tar.gz"
+        tmp=$(mktemp -d)
+        curl -fsSL "$url" -o "$tmp/gh.tar.gz"
+        tar -xzf "$tmp/gh.tar.gz" -C "$tmp"
+        mkdir -p "$HOME/.local/bin"
+        mv "$tmp/gh_${tag}_${os}_${arch}/bin/gh" "$HOME/.local/bin/gh"
+        chmod +x "$HOME/.local/bin/gh"
+        rm -rf "$tmp"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        "$HOME/.local/bin/gh" --version | head -n1
+
+    - name: Install amp CLI (wheel-only)
+      shell: bash
+      env:
+        DIST_TOKEN: ${{ inputs.dist-token }}
+        AMP_VERSION: ${{ inputs.version }}
+        DIST_REPO: ${{ inputs.dist-repo }}
+      run: |
+        set -euo pipefail
+        if [ -z "${DIST_TOKEN:-}" ] || [ -z "${AMP_VERSION:-}" ] || [ -z "${DIST_REPO:-}" ]; then
+          echo "::error::wheel installation requires all three inputs: dist-token, version, and dist-repo"
+          echo "::error::  dist-token: '${{ inputs.dist-token }}' (from secrets.AMP_DIST_TOKEN)"
+          echo "::error::  version: '${{ inputs.version }}' (from vars.AMP_VERSION)"
+          echo "::error::  dist-repo: '${{ inputs.dist-repo }}' (from vars.AMP_DIST_REPO)"
+          exit 1
+        fi
+        echo "Installing amp $AMP_VERSION from $DIST_REPO (compiled wheel)."
+        tmp=$(mktemp -d)
+        # Download all wheels from the release and let pip resolve the compatible one
+        # HOST github.com is required on GHEC-DR: without it gh inherits
+        # GITHUB_SERVER_URL from the runner and routes to the enterprise host.
+        GH_TOKEN="$DIST_TOKEN" GH_HOST="github.com" gh release download "v${AMP_VERSION}" \
+          --repo "$DIST_REPO" --pattern '*.whl' --dir "$tmp" --clobber
+        # --find-links picks the matching amp wheel; deps still resolve from PyPI.
+        pip install --find-links "$tmp" "amp==${AMP_VERSION}"
+        rm -rf "$tmp"
+
+    - name: Install gh extensions
+      if: inputs.extensions != ''
+      shell: bash
+      env:
+        # Extensions are hosted on github.com regardless of which GHE tenant
+        # this runner serves. Pinning GH_HOST here prevents `gh extension
+        # install` from resolving `github/gh-gei` against the tenant's API
+        # (which 404s and was previously swallowed by `2>/dev/null || true`,
+        # so a missing `gh gei` only surfaced later as "unknown command").
+        GH_HOST: github.com
+        # GH_TOKEN is intentionally NOT set from the workflow context: gh
+        # would send a tenant-scoped token to api.github.com and get HTTP
+        # 401. If `github-com-token` is supplied, it gets exported as
+        # GH_TOKEN inside the script (after the defensive unset), giving us
+        # an authenticated 5000/hr rate limit. Anonymous fallback (60/hr)
+        # still works when the input is empty.
+        GH_COM_TOKEN: ${{ inputs.github-com-token }}
+        EXTS: ${{ inputs.extensions }}
+      # Each shortname maps to a repo: gei → github/gh-gei,
+      # ado2gh → github/gh-ado2gh, bbs2gh → github/gh-bbs2gh,
+      # bbc → katiem0/gh-bbc-exporter. Idempotency via an explicit
+      # `gh extension list` check rather than swallowing stderr — that lets
+      # real install errors abort the job instead of failing downstream as
+      # cryptic "unknown command".
+      run: |
+        set -euo pipefail
+        # Defensive: ensure no inherited tenant token leaks into github.com calls.
+        unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN || true
+        # If a github.com PAT was provided, export it as GH_TOKEN for the
+        # duration of this step only. GH_HOST=github.com is pinned above so
+        # gh sends the token to the correct host (not the tenant).
+        if [ -n "${GH_COM_TOKEN:-}" ]; then
+          export GH_TOKEN="$GH_COM_TOKEN"
+        fi
+        installed=$(gh extension list 2>/dev/null | awk '{print $1}' || true)
+        IFS=',' read -ra parts <<< "$EXTS"
+        for raw in "${parts[@]}"; do
+          name=$(printf '%s' "$raw" | tr -d '[:space:]')
+          [ -z "$name" ] && continue
+          case "$name" in
+            gei)    repo=github/gh-gei ;;
+            ado2gh) repo=github/gh-ado2gh ;;
+            bbs2gh) repo=github/gh-bbs2gh ;;
+            bbc)    repo=katiem0/gh-bbc-exporter ;;
+            *) echo "::warning::Unknown gh extension shortname '$name' — skipping."; continue ;;
+          esac
+          if printf '%s\n' "$installed" | grep -qx "gh-$name"; then
+            echo "gh-$name already installed — skipping."
+            continue
+          fi
+          echo "Installing $repo …"
+          gh extension install "$repo"
+        done

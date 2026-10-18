@@ -1,0 +1,9 @@
+# Example mapping: Azure DevOps → GitHub target
+# To use: copy this file, rename to your_project.yml, update values, and reference in migrations
+
+source_org: <ado-org-name>
+team_project: <ado-project-name>
+target_org: <github-org>
+prefix: <repo-prefix>
+visibility: private
+labels: []

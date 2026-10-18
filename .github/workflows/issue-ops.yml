@@ -1,0 +1,201 @@
+# -----------------------------------------------------------------------------
+# Copyright (c) 2026 Xebia. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# This software, associated workflows, and configuration assets are the
+# proprietary property of Xebia. Possession or use of this software is
+# authorized strictly during an active professional services engagement with
+# Xebia and subject to the terms of the governing engagement agreement.
+#
+# Unauthorized copying, reverse engineering, redistribution, or continued use
+# after engagement termination is strictly prohibited.
+#
+# DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY:
+# THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL
+# XEBIA OR ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) ARISING IN ANY WAY OUT OF THE USE OF OR INABILITY TO USE THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# USAGE IS ENTIRELY AT YOUR OWN RISK.
+# -----------------------------------------------------------------------------
+
+name: Issue Operations
+# /dryrun, /migrate, /remigrate are enqueue-only when the queue is on (the
+# default) — they stamp status:*-queued and exit while the Migration Worker
+# does the real work. Tag those titles "(queued)" so operators reading the
+# Actions list don't confuse the 30s enqueue run with the actual migration.
+run-name: "${{ (startsWith(github.event.comment.body, '/dryrun') || startsWith(github.event.comment.body, '/migrate') || startsWith(github.event.comment.body, '/remigrate')) && format('{0} (queued)', github.event.comment.body) || (startsWith(github.event.comment.body, '/') && github.event.comment.body || '(non-command comment, skipped)') }} → #${{ github.event.issue.number }} ${{ github.event.issue.title }}"
+
+on:
+  issue_comment:
+    types: [created]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  execute:
+    if: >-
+      !github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/')
+    runs-on: ${{ fromJSON(vars.AMP_RUNNER_ISSUE_OPS || vars.AMP_RUNNER || '"ubuntu-latest"') }}
+
+    steps:
+      # Mint App tokens for the control repo. AMP App (AMP_APP_*) is the
+      # dedicated control-repo credential and is preferred; the primary App
+      # (APP_*) is back-compat fallback for installs where the control repo
+      # lives on the host tenant.
+      - name: Mint AMP App token (best-effort)
+        id: amp-app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.AMP_APP_ID }}
+          private-key: ${{ secrets.AMP_APP_PRIVATE_KEY }}
+
+      - name: Mint primary App token (best-effort)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ steps.amp-app-token.outputs.token || steps.app-token.outputs.token || secrets.GH_AMP_PAT || secrets.GH_DEST_PAT }}
+
+      - name: Setup AMP
+        uses: ./.github/actions/setup-amp
+        with:
+          dist-token: ${{ secrets.AMP_DIST_TOKEN }}
+          version:    ${{ vars.AMP_VERSION }}
+          dist-repo:  ${{ vars.AMP_DIST_REPO }}
+          extensions: gei,ado2gh,bbs2gh,bbc
+          # Optional github.com PAT (no scopes) raises api.github.com from
+          # 60/hr anon to 5000/hr authenticated — needed when many workers
+          # share a runner egress IP. Falls back to anonymous if unset.
+          github-com-token: ${{ secrets.GH_COM_TOKEN }}
+
+      - name: Parse command
+        id: parse
+        run: |
+          python3 -c "
+          from amp.issue_parser import parse_command
+          comment = '''${{ github.event.comment.body }}'''
+          cmd, args = parse_command(comment)
+          print(f'command={cmd}')
+          print(f'args={\" \".join(args)}')
+          " >> "$GITHUB_OUTPUT"
+
+      - name: Execute command
+        id: execute
+        continue-on-error: true
+        run: |
+          # Print the issue URL at the top and bottom of this step so a log
+          # reader can click straight through to the repo/issue this run is
+          # operating on without scrolling past the python output. The trap
+          # on EXIT ensures the bottom banner prints even when the python
+          # command fails (default shell is `bash -eo pipefail`, which would
+          # otherwise short-circuit before the trailing echo).
+          #
+          # Percent-encode `-` in the URL: GitHub's secret-masker redacts any
+          # substring of any registered secret value, and at least one secret
+          # in this org has a value that overlaps with the org slug, turning
+          # `amp-tst` into `amp***tst` in logs. `%2D` resolves identically in
+          # browsers and bypasses the substring match.
+          URL_SAFE="${ISSUE_URL//-/%2D}"
+          trap 'echo ""; echo "::notice::Issue: $URL_SAFE"; echo "Title: $ISSUE_TITLE"' EXIT
+
+          echo "Issue: $URL_SAFE"
+          echo "Title: $ISSUE_TITLE"
+          echo ""
+
+          python3 -m amp.commands \
+            --command "${{ steps.parse.outputs.command }}" \
+            --args "${{ steps.parse.outputs.args }}" \
+            --issue-number ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }}
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_DEST_PAT: ${{ secrets.GH_DEST_PAT }}
+          GH_AMP_PAT: ${{ secrets.GH_AMP_PAT }}
+          GH_API_URL: ${{ vars.GH_API_URL }}
+          GH_DEST_API_URL: ${{ vars.GH_DEST_API_URL }}
+          GH_AMP_API_URL: ${{ vars.GH_AMP_API_URL }}
+          ADO_PAT: ${{ secrets.ADO_PAT }}
+          BITBUCKET_API_TOKEN: ${{ secrets.BITBUCKET_API_TOKEN }}
+          BITBUCKET_EMAIL: ${{ vars.BITBUCKET_EMAIL }}
+          SANDBOX_ORG: ${{ vars.SANDBOX_ORG }}
+          # GitHub App auth (optional). Three App pairs, one per token domain:
+          #   APP_*       — host-tenant App (control repo when on host tenant)
+          #   DEST_APP_*  — destination-tenant App (migration target)
+          #   AMP_APP_*   — control-repo-tenant App (preferred for AMP repo ops)
+          # All resolve to empty strings when unset; helpers fall back to PAT silently.
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          DEST_APP_ID: ${{ secrets.DEST_APP_ID }}
+          DEST_APP_PRIVATE_KEY: ${{ secrets.DEST_APP_PRIVATE_KEY }}
+          AMP_APP_ID: ${{ secrets.AMP_APP_ID }}
+          AMP_APP_PRIVATE_KEY: ${{ secrets.AMP_APP_PRIVATE_KEY }}
+          # When "true", /migrate, /dryrun, /remigrate enqueue instead of
+          # running inline. The migration-dispatcher.yml workflow drains the queue.
+          AMP_QUEUE_ENABLED: ${{ vars.AMP_QUEUE_ENABLED }}
+          # When "true", `amp analyze` and `/update-issue` re-analysis skip
+          # emitting the per-provider default `dst-prefix:` label. Must match
+          # analyze.yml so that bulk-discover and per-issue refresh agree.
+          AMP_DISABLE_DEFAULT_REPO_PREFIX: ${{ vars.AMP_DISABLE_DEFAULT_REPO_PREFIX }}
+          # When "true", `/update-issue` re-analysis skips discovering source
+          # teams and emitting `src-team:*` labels. Must match analyze.yml /
+          # refresh.yml so single-issue and bulk paths agree.
+          AMP_DISABLE_SOURCE_TEAMS: ${{ vars.AMP_DISABLE_SOURCE_TEAMS }}
+          AMP_PROJECT_OWNER: ${{ vars.AMP_PROJECT_OWNER }}
+          AMP_PROJECT_NUMBER: ${{ vars.AMP_PROJECT_NUMBER }}
+          # Pass the issue URL/title via env (not template injection) so
+          # titles containing quotes or backticks don't break the script.
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          # Mirror Python's `amp` logger to a file the advisor reads. See
+          # the same env in migration-worker.yml for rationale.
+          AMP_LOG_FILE: logs/amp.log
+
+      - name: AI Failure Analysis
+        if: steps.execute.outcome == 'failure'
+        run: |
+          python3 -m amp.ai.advisor \
+            --issue-number ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --logs-dir logs/ \
+            --repair-mode
+        env:
+          GH_DEST_PAT: ${{ secrets.GH_DEST_PAT }}
+          GH_AMP_PAT: ${{ secrets.GH_AMP_PAT }}
+          MODELS_TOKEN: ${{ secrets.MODELS_TOKEN }}
+          ADO_PAT: ${{ secrets.ADO_PAT }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_API_URL: ${{ vars.GH_API_URL }}
+          GH_DEST_API_URL: ${{ vars.GH_DEST_API_URL }}
+          GH_AMP_API_URL: ${{ vars.GH_AMP_API_URL }}
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          DEST_APP_ID: ${{ secrets.DEST_APP_ID }}
+          DEST_APP_PRIVATE_KEY: ${{ secrets.DEST_APP_PRIVATE_KEY }}
+          AMP_APP_ID: ${{ secrets.AMP_APP_ID }}
+          AMP_APP_PRIVATE_KEY: ${{ secrets.AMP_APP_PRIVATE_KEY }}
+          SANDBOX_ORG: ${{ vars.SANDBOX_ORG }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-logs-${{ github.event.issue.number }}
+          path: logs/
+          retention-days: 30
+
+      - name: Fail job if execute failed
+        if: steps.execute.outcome == 'failure'
+        run: exit 1

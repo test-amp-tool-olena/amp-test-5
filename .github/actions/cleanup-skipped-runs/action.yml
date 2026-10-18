@@ -1,0 +1,70 @@
+name: Cleanup Skipped Runs
+description: Delete skipped workflow runs from the current repo. Drop in as the last step of a workflow to keep the Actions run history clean.
+
+inputs:
+  github-token:
+    description: "Token with actions:write scope on the repo (e.g. secrets.GH_DEST_PAT or GITHUB_TOKEN with actions: write permission)."
+    required: true
+  limit:
+    description: Maximum number of skipped runs to delete per invocation.
+    required: false
+    default: "200"
+
+runs:
+  using: composite
+  steps:
+    - name: Delete skipped runs
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        LIMIT: ${{ inputs.limit }}
+      run: |
+        set -euo pipefail
+        # gh defaults to github.com; on GHE-DR/GHES the control repo lives
+        # on the workflow's own tenant. Strip the scheme from the auto-set
+        # GITHUB_SERVER_URL to get the bare hostname gh expects.
+        export GH_HOST="${GITHUB_SERVER_URL#https://}"
+        ids=$(gh run list --repo "$REPO" --status skipped --limit "$LIMIT" --json databaseId -q '.[].databaseId')
+        if [ -z "$ids" ]; then
+          echo "No skipped runs to delete."
+          exit 0
+        fi
+        count=$(printf '%s\n' "$ids" | wc -l | tr -d ' ')
+        echo "Deleting ${count} skipped run(s)..."
+        deleted=0; gone=0; rate_limited=0; failed=0
+        # `gh run list --status skipped` can return IDs for clustered child
+        # attempts whose parent run has already been GC'd; the delete API
+        # then 404s on those. Treat 404 as already-gone (the desired state)
+        # and only count genuine errors as failures.
+        #
+        # API rate-limit (403/429) is also treated as a soft failure: this
+        # cleanup is best-effort housekeeping and runs on every label-add,
+        # so a burst of cascading workflows can drain the PAT budget. When
+        # that happens we want to back off, not fail the parent workflow
+        # (which had nothing to do with the cleanup) and create yet more
+        # red checks for the operator to ignore. Next invocation will pick
+        # up the leftover IDs once the budget resets.
+        while IFS= read -r id; do
+          if err=$(gh run delete "$id" --repo "$REPO" 2>&1); then
+            echo "  deleted ${id}"
+            deleted=$((deleted + 1))
+          elif printf '%s' "$err" | grep -qiE 'not found|could not find|404'; then
+            echo "  already gone ${id}"
+            gone=$((gone + 1))
+          elif printf '%s' "$err" | grep -qiE 'rate limit exceeded|HTTP 429'; then
+            echo "  rate-limited ${id}; deferring remaining deletes to next run"
+            rate_limited=$((rate_limited + 1))
+            # Bail early: the remaining IDs will all 403 too, and each
+            # attempt consumes an Actions-API call slot we'd rather give
+            # back to the dispatch path that does user-visible work.
+            break
+          else
+            echo "  failed ${id}: ${err}"
+            failed=$((failed + 1))
+          fi
+        done <<< "$ids"
+        echo "Summary: ${deleted} deleted, ${gone} already gone, ${rate_limited} rate-limited, ${failed} failed."
+        # Best-effort housekeeping: never fail the parent workflow over a
+        # delete error (e.g. transient 5xx). Leftover IDs get picked up on
+        # the next invocation.
